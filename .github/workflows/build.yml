@@ -1,0 +1,300 @@
+name: Linux
+run-name: "Linux · source run #${{ inputs.source_run_id }}.${{ inputs.source_run_attempt }} · ${{ inputs.source_sha }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_sha:
+        description: Exact source commit SHA.
+        required: true
+        type: string
+      source_ref:
+        description: Source Git ref.
+        required: true
+        type: string
+      source_run_id:
+        description: Source Release workflow run ID.
+        required: true
+        type: string
+      source_run_attempt:
+        description: Source Release workflow run attempt.
+        required: true
+        type: string
+      version:
+        description: Display version from the source commit.
+        required: true
+        type: string
+      appupdateversion:
+        description: Update version from the source commit.
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ inputs.source_ref }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    name: Linux ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    # arm64 的镜像尚未适配，先并行跑起来看结果，通过前不阻塞发布
+    continue-on-error: ${{ matrix.arch != 'x64' }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-latest
+            updater: tlinuxupd
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            updater: tlinuxarmupd
+    timeout-minutes: 359
+
+    env:
+      IMAGE_TAG: ayugram:centos_env
+
+    steps:
+      - name: Validate dispatcher.
+        run: |
+          set -euo pipefail
+          test "$GITHUB_ACTOR" = "KiritoXDone"
+
+      - name: Check out repository.
+        uses: actions/checkout@v7
+        with:
+          repository: Kindness-Kismet/AyuGramDesktop-Plus
+          ref: ${{ inputs.source_sha }}
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Validate source request.
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          SOURCE_RUN_ATTEMPT: ${{ inputs.source_run_attempt }}
+          VERSION: ${{ inputs.version }}
+          APP_UPDATE_VERSION: ${{ inputs.appupdateversion }}
+        run: |
+          set -euo pipefail
+          python3 scripts/build_provenance.py validate-source \
+            --repository Kindness-Kismet/AyuGramDesktop-Plus \
+            --sha "$SOURCE_SHA" \
+            --ref "$SOURCE_REF" \
+            --run-id "$SOURCE_RUN_ID" \
+            --run-attempt "$SOURCE_RUN_ATTEMPT" \
+            --version "$VERSION" \
+            --appupdateversion "$APP_UPDATE_VERSION" \
+            --workflow-path .github/workflows/release.yml
+
+      - name: Check packer cache guard.
+        run: |
+          set -euo pipefail
+          python3 -c "from pathlib import Path; assert b'ccache:disable' in Path('Telegram/SourceFiles/_other/packer.cpp').read_bytes()[:4096]"
+
+      - name: First set up.
+        run: |
+          set -euo pipefail
+          sudo apt update
+          curl -sSL https://install.python-poetry.org | python3 -
+          ccache_arch=$(uname -m)
+          curl -sSL "https://github.com/ccache/ccache/releases/download/v4.13.6/ccache-4.13.6-linux-${ccache_arch}-glibc.tar.xz" \
+          | sudo tar xJ -C /usr/local/bin --strip-components=1 "ccache-4.13.6-linux-${ccache_arch}-glibc/ccache"
+          echo "CCACHE_DIR=$RUNNER_TEMP/.ayugram-cache" >> $GITHUB_ENV
+          cd Telegram/build/docker/centos_env
+          poetry install
+          # 正式版：DEBUG 与 LTO 均关闭
+          DOCKERFILE=$(DEBUG= LTO= poetry run gen_dockerfile)
+          echo "$DOCKERFILE" > Dockerfile
+          rm -rf __pycache__
+
+      - name: Free up disk space.
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+
+      - name: Set up Docker Buildx.
+        id: setup-buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Restore libraries cache.
+        id: cache-libs
+        uses: actions/cache/restore@v6
+        with:
+          path: |
+            ${{ runner.temp }}/.buildx-cache
+            ${{ runner.temp }}/.mount-cache
+          key: ${{ runner.OS }}-libs-${{ matrix.arch }}-${{ hashFiles('Telegram/build/docker/centos_env/**') }}
+          restore-keys: ${{ runner.OS }}-libs-${{ matrix.arch }}-
+
+      - name: Restore Docker cache mounts.
+        uses: reproducible-containers/buildkit-cache-dance@v3.4.0
+        with:
+          builder: ${{ steps.setup-buildx.outputs.name }}
+          cache-dir: ${{ runner.temp }}/.mount-cache
+          dockerfile: Telegram/build/docker/centos_env/Dockerfile
+          skip-extraction: ${{ steps.cache-libs.outputs.cache-hit }}
+
+      - name: Build dependencies.
+        uses: docker/build-push-action@v7
+        with:
+          context: Telegram/build/docker/centos_env
+          load: true
+          tags: ${{ env.IMAGE_TAG }}
+          cache-from: type=local,src=${{ runner.temp }}/.buildx-cache
+          cache-to: type=local,dest=${{ runner.temp }}/.buildx-cache-new,mode=max
+
+      - name: Move cache.
+        run: |
+          set -euo pipefail
+          rm -rf ${{ runner.temp }}/.buildx-cache
+          mv ${{ runner.temp }}/.buildx-cache{-new,}
+
+      # 依赖层建好立即入库，后续应用构建失败不再连带丢失镜像缓存
+      - name: Save libraries cache.
+        if: steps.cache-libs.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        with:
+          path: |
+            ${{ runner.temp }}/.buildx-cache
+            ${{ runner.temp }}/.mount-cache
+          key: ${{ steps.cache-libs.outputs.cache-primary-key }}
+
+      - name: Restore build cache.
+        id: cache-build
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ runner.OS }}-ayugram-${{ matrix.arch }}-${{ github.run_id }}
+          restore-keys: ${{ runner.OS }}-ayugram-${{ matrix.arch }}-
+
+      # Packer 是 Telegram 的构建依赖，私钥头文件必须在编译前就位
+      - name: Write packer signing key.
+        env:
+          PACKER_PRIVATE_H: ${{ secrets.PACKER_PRIVATE_H }}
+        run: |
+          set -euo pipefail
+          test -n "$PACKER_PRIVATE_H"
+          printf '%s' "$PACKER_PRIVATE_H" > Telegram/SourceFiles/_other/packer_private.h
+
+      - name: Build AyuGram Desktop.
+        run: |
+          set -euo pipefail
+          ccache -z
+
+          docker run --rm \
+          -u $(id -u) \
+          -v $PWD:/usr/src/tdesktop \
+          -v ${{ env.CCACHE_DIR }}:/var/cache/ccache \
+          -e CONFIG=Release \
+          -e CCACHE_SLOPPINESS=pch_defines,time_macros \
+          $IMAGE_TAG \
+          env -u CCACHE_DISABLE /usr/src/tdesktop/Telegram/build/docker/centos_env/build.sh \
+          -D CMAKE_CONFIGURATION_TYPES=Release \
+          -D TDESKTOP_API_ID=2040 \
+          -D TDESKTOP_API_HASH=b18441a1ff607e10a989891a5462e627 \
+          -D DESKTOP_APP_DISABLE_AUTOUPDATE=OFF \
+          -D DESKTOP_APP_DISABLE_CRASH_REPORTS=OFF \
+          -D AYUGRAM_BUILD_PACKER=ON
+
+      - name: Count ccache misses.
+        id: ccache-stats
+        run: |
+          set -euo pipefail
+          MISSES=$(ccache --print-stats | sed -n 's/^cache_miss\t//p' | head -1)
+          case "$MISSES" in (*[!0-9]*|'') MISSES=0;; esac
+          echo "misses=$MISSES" >> $GITHUB_OUTPUT
+          echo "ccache misses this run: $MISSES"
+
+      - name: Save build cache.
+        if: >
+          github.ref_name == github.event.repository.default_branch
+            && fromJSON(steps.ccache-stats.outputs.misses) > 300
+        uses: actions/cache/save@v6
+        with:
+          path: ${{ env.CCACHE_DIR }}
+          key: ${{ steps.cache-build.outputs.cache-primary-key }}
+
+      - name: Check release output.
+        run: |
+          set -euo pipefail
+          filePath="out/Release/AyuGram"
+          if test -f "$filePath"; then
+            echo "Build successfully done! :)"
+            size=$(stat -c %s "$filePath")
+            echo "File size of ${filePath}: ${size} Bytes."
+          else
+            echo "Build error, output file does not exist."
+            exit 1
+          fi
+
+      - name: Package release output.
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^AppVersionStrSmall //p' Telegram/build/version)
+          test -n "$version"
+          cd out/Release
+          rm -f "AyuGram-v${version}-linux-${{ matrix.arch }}.zip"
+          zip "AyuGram-v${version}-linux-${{ matrix.arch }}.zip" AyuGram
+          test ! -f Updater || zip "AyuGram-v${version}-linux-${{ matrix.arch }}.zip" Updater
+
+      # Packer 链接容器内的库，并按编译架构生成独立更新包。
+      - name: Pack update.
+        run: |
+          set -euo pipefail
+          version=$(sed -n 's/^AppUpdateVersion  *//p' Telegram/build/version)
+          test -n "$version"
+          docker run --rm \
+          -u $(id -u) \
+          -v $PWD:/usr/src/tdesktop \
+          $IMAGE_TAG \
+          bash -c "cd /usr/src/tdesktop/out/Release && ./Packer -version $version -path AyuGram -path Updater"
+          test -s "out/Release/${{ matrix.updater }}${version}"
+
+      - name: Write artifact provenance.
+        env:
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          SOURCE_REF: ${{ inputs.source_ref }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          SOURCE_RUN_ATTEMPT: ${{ inputs.source_run_attempt }}
+          VERSION: ${{ inputs.version }}
+          APP_UPDATE_VERSION: ${{ inputs.appupdateversion }}
+        run: |
+          set -euo pipefail
+          archive=$(ls out/Release/AyuGram-v*-linux-${{ matrix.arch }}.zip)
+          update="out/Release/${{ matrix.updater }}${APP_UPDATE_VERSION}"
+          python3 scripts/build_provenance.py write-artifact-manifest \
+            --platform linux \
+            --arch "${{ matrix.arch }}" \
+            --source-repository Kindness-Kismet/AyuGramDesktop-Plus \
+            --source-ref "$SOURCE_REF" \
+            --source-sha "$SOURCE_SHA" \
+            --source-run-id "$SOURCE_RUN_ID" \
+            --source-run-attempt "$SOURCE_RUN_ATTEMPT" \
+            --builder-repository "$GITHUB_REPOSITORY" \
+            --builder-run-id "$GITHUB_RUN_ID" \
+            --builder-run-attempt "$GITHUB_RUN_ATTEMPT" \
+            --version "$VERSION" \
+            --appupdateversion "$APP_UPDATE_VERSION" \
+            --output "out/Release/provenance-linux-${{ matrix.arch }}.json" \
+            --file "$archive" \
+            --file "$update"
+
+      - name: Upload artifact.
+        uses: actions/upload-artifact@v7
+        with:
+          name: AyuGram-Linux-${{ matrix.arch }}
+          path: |
+            out/Release/AyuGram-v*-linux-${{ matrix.arch }}.zip
+            out/Release/${{ matrix.updater }}*
+            out/Release/provenance-linux-${{ matrix.arch }}.json
+          retention-days: 7
+
+      - name: Remove packer signing key.
+        if: always()
+        run: rm -f Telegram/SourceFiles/_other/packer_private.h
